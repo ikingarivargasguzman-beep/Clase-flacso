@@ -1,0 +1,159 @@
+# =====================================================================
+# Activiadad
+# =====================================================================
+
+# =========================
+# 0) Paquetes y semilla
+# =========================
+install.packages("ABM")
+install.packages("ggplot2")
+
+#La primera vez Correr todo, la segundda correr desde Liabrary
+
+library(ABM)
+library(ggplot2)
+set.seed(1)
+
+# =========================
+# 1) Parámetros del modelo
+# =========================
+N               <- 5000   # Personas
+Tmax            <- 36     # Meses a simular
+delay_prob_base <- 0.30   # Probabilidad de no servicio
+lambda_cred     <- 0.60   # redibilidad
+
+# Tarifa preferente y accesibilidad
+base_transfer_per_child <- 300   # Ahorro por viaje diario
+max_children_paid       <- 2     # Max viajes cubiertos
+poverty_line            <- 600   # Distancia maxima
+
+
+# Características de las personas
+ingreso_mediano  <- 500  # Distancia mediana
+ingreso_desigual <- 0.5    # dispersion de distancia
+prob_hijos       <- c(0.25, 0.40, 0.25, 0.10)   # probabilidad de viajes
+
+# Si la persona no usa el camión, recibe información de sus vecinos
+senal_publica <- TRUE    
+
+# TRUE = corrección del modelo simple (quien no asiste recibe la señal pública)
+# FALSE = regla original 
+
+# =====================================
+# 2) Crear simulación y estado inicial
+# =====================================
+sim <- Simulation$new(N)
+
+for (i in 1:N) {
+  theta    <- rnorm(1, mean = 300, sd = 80)                       # Umbral, igual que en la sesión 1
+  cred0    <- 1 - delay_prob_base                                 # Credibilidad inicial = 0.70
+  n_hijos  <- sample(0:3, size = 1, prob = prob_hijos)            # Número de hijxs
+  Y_hogar  <- rlnorm(1, meanlog = log(ingreso_mediano), sdlog = ingreso_desigual)  # Ingreso
+  elegible <- Y_hogar < poverty_line                              # Regla de focalización
+  sim$setState(i, list("N", theta = theta, cred = cred0,
+                       n_hijos = n_hijos, Y_hogar = Y_hogar, elegible = elegible))
+}
+
+# Guardamos una copia de los atributos para analizar resultados por grupo al final
+hogares <- data.frame(id = 1:N, n_hijos = NA, elegible = NA, estado_final = NA)
+
+# ======================================
+# 3) Loggers (contadores automáticos)
+# ======================================
+sim$addLogger(newCounter("A", "A"))
+sim$addLogger(newCounter("N", "N"))
+
+# =========================================================
+# 4) Regla mensual: leer -> decidir -> escribir
+# =========================================================
+tick_handler <- function(time, sim, agent) {
+  for (i in 1:N) {
+    # --- Leer ---
+    ai <- getAgent(sim, i)
+    st <- getState(ai)
+    
+    # --- Decidir ---
+    # NUEVO: la transferencia depende de la elegibilidad y del número de hijxs (con tope)
+    hijos_cubiertos <- min(st$n_hijos, max_children_paid)
+    transfer_eff    <- if (st$elegible) base_transfer_per_child * hijos_cubiertos else 0
+    benefit         <- transfer_eff * st$cred                      # Igual que en la sesión 1
+    new_state       <- if (benefit >= st$theta) "A" else "N"
+    
+    # --- Señal (igual que en la sesión 1) ---
+    if (new_state == "A") {
+      senal <- as.numeric(runif(1) > delay_prob_base)
+    } else if (senal_publica) {
+      senal <- 1 - delay_prob_base
+    } else {
+      senal <- 0
+    }
+    cred_new <- (1 - lambda_cred) * st$cred + lambda_cred * senal
+    
+    # --- Escribir --- (todos los atributos, aunque no cambien)
+    setState(ai, list(new_state, theta = st$theta, cred = cred_new,
+                      n_hijos = st$n_hijos, Y_hogar = st$Y_hogar, elegible = st$elegible))
+    
+    # Registro para el análisis por grupo
+    hogares$n_hijos[i]      <<- st$n_hijos
+    hogares$elegible[i]     <<- st$elegible
+    hogares$estado_final[i] <<- new_state
+  }
+  if (time < Tmax) schedule(agent, newEvent(time + 1, tick_handler))
+}
+
+# ==============================
+# 5) Ejecutar la simulación
+# ==============================
+schedule(sim$get, newEvent(0, tick_handler))
+res <- sim$run(0:Tmax)
+res$attend <- res$A / N
+# Nota: el mes 0 es el estado inicial, antes de la primera decisión.
+
+# ==============================
+# 6) Resultados
+# ==============================
+escenario <- paste0("monto", base_transfer_per_child, "_tope", max_children_paid, "_linea", poverty_line)
+
+# 6a) ¿Quién es elegible y quién tiene hijxs?
+cat("\nHogares elegibles:", round(mean(hogares$elegible), 3),
+    "\nHogares con al menos un hijx:", round(mean(hogares$n_hijos > 0), 3), "\n")
+
+# 6b) Asistencia total (todos los hogares) y entre hogares con hijxs
+con_hijos <- mean(hogares$n_hijos > 0)
+resumen <- data.frame(escenario = escenario, mes = c(1, 12, 36),
+                      asistencia_total     = round(res$attend[match(c(1, 12, 36), res$times)], 3),
+                      asistencia_con_hijos = round(res$attend[match(c(1, 12, 36), res$times)] / con_hijos, 3))
+print(resumen)
+write.csv(resumen, paste0("resumen_", escenario, ".csv"), row.names = FALSE)
+
+# 6c) Asistencia por grupo en el último mes (¿para quién funciona el programa?)
+por_grupo <- aggregate(asiste ~ elegible + n_hijos,
+                       data = transform(hogares, asiste = estado_final == "A"),
+                       FUN = mean)
+por_grupo$asiste <- round(por_grupo$asiste, 2)
+print(por_grupo)
+write.csv(por_grupo, paste0("por_grupo_", escenario, ".csv"), row.names = FALSE)
+
+# ==============================
+# 7) Gráficos
+# ==============================
+p <- ggplot(res, aes(x = times, y = attend)) +
+  geom_area(fill = "steelblue", alpha = 0.12) +
+  geom_line(linewidth = 1.4, color = "lightblue", lineend = "round") +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(title = "CCT por hijx con elegibilidad por pobreza",
+       subtitle = escenario, x = "Mes", y = "Proporción que asiste (todos los hogares)") +
+  theme_minimal(base_size = 14)
+p
+ggsave(paste0("asistencia_", escenario, ".png"), plot = p, width = 8, height = 5, dpi = 300)
+
+p2 <- ggplot(por_grupo, aes(x = factor(n_hijos), y = asiste,
+                            fill = ifelse(elegible, "Elegible", "No elegible"))) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Elegible" = "lightblue", "No elegible" = "grey70")) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(title = "Asistencia en el mes 36 por grupo", subtitle = escenario,
+       x = "Número de hijxs", y = "Proporción que asiste", fill = NULL) +
+  theme_minimal(base_size = 14)
+p2
+ggsave(paste0("por_grupo_", escenario, ".png"), plot = p2, width = 8, height = 5, dpi = 300)
